@@ -97,6 +97,7 @@ type StartUpload struct {
 	ContentType string  `json:"content_type,omitempty"`
 	OnConflict  string  `json:"on_conflict,omitempty"`
 	ModifiedAt  string  `json:"modified_at,omitempty"` // recorded at once for an empty file
+	SHA256      string  `json:"sha256,omitempty"`      // lets the server skip identical content
 }
 
 // PartURL is one presigned URL of an upload
@@ -118,6 +119,10 @@ type UploadStarted struct {
 	FileID        string    `json:"file_id"`
 	MultipartID   string    `json:"multipart_id"`
 	File          *Item     `json:"file"` // set for action created
+	Existing      *struct {
+		ID   string `json:"id"`
+		Name string `json:"name"`
+	} `json:"existing"` // the identical file, for action skip
 }
 
 // PartsRequest is the body of POST /uploads/{id}/parts
@@ -150,10 +155,15 @@ type Workspaces struct {
 	} `json:"workspaces"`
 }
 
-// Error is a JSON error from the API
+// Error is a JSON error from the API: a problem details object (RFC 9457)
+// with a stable code, which also carries the older error envelope.
 type Error struct {
-	Status  int `json:"-"`
-	Wrapper struct {
+	Status         int             `json:"-"`
+	ProblemCode    string          `json:"code"`
+	ProblemTitle   string          `json:"title"`
+	ProblemDetail  string          `json:"detail"`
+	ProblemDetails json.RawMessage `json:"details"`
+	Wrapper        struct {
 		Code    string          `json:"code"`
 		Message string          `json:"message"`
 		Details json.RawMessage `json:"details"`
@@ -162,14 +172,38 @@ type Error struct {
 }
 
 // Code returns the error code
-func (e *Error) Code() string { return e.Wrapper.Code }
+func (e *Error) Code() string {
+	if e.ProblemCode != "" {
+		return e.ProblemCode
+	}
+	return e.Wrapper.Code
+}
+
+// Message returns the human readable message
+func (e *Error) Message() string {
+	switch {
+	case e.ProblemDetail != "":
+		return e.ProblemDetail
+	case e.Wrapper.Message != "":
+		return e.Wrapper.Message
+	}
+	return e.ProblemTitle
+}
+
+// Details returns the error's details object, if any
+func (e *Error) Details() json.RawMessage {
+	if len(e.ProblemDetails) > 0 && string(e.ProblemDetails) != "null" {
+		return e.ProblemDetails
+	}
+	return e.Wrapper.Details
+}
 
 // Error satisfies the error interface
 func (e *Error) Error() string {
-	if e.Wrapper.Message == "" {
+	if e.Message() == "" {
 		return fmt.Sprintf("tarkle API error %d: %s", e.Status, e.Body)
 	}
-	return fmt.Sprintf("tarkle API error %d %s: %s", e.Status, e.Wrapper.Code, e.Wrapper.Message)
+	return fmt.Sprintf("tarkle API error %d %s: %s", e.Status, e.Code(), e.Message())
 }
 
 // IncompleteDetails are the details of a 409 incomplete answer. The part

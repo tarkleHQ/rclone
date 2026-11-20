@@ -194,7 +194,9 @@ func newTestFs(t *testing.T, url string, client *http.Client) *Fs {
 	t.Helper()
 	ctx := context.Background()
 	f := &Fs{
+		opt:      Options{KeepVersions: true},
 		conflict: &conflictCache{},
+		limit:    newRateLimit(),
 		srv:      rest.NewClient(client).SetRoot(url + apiPath),
 		pacer:    fs.NewPacer(ctx, pacer.NewDefault(pacer.MinSleep(time.Millisecond), pacer.MaxSleep(time.Millisecond))),
 	}
@@ -223,12 +225,12 @@ func TestConflictDecisionIsCachedPerRun(t *testing.T) {
 	f := newTestFs(t, ts.URL, http.DefaultClient)
 	ctx := context.Background()
 
-	_, err := f.startUpload(ctx, "a.txt", "", 10, "text/plain", time.Time{})
+	_, err := f.startUpload(ctx, "a.txt", "", 10, "text/plain", time.Time{}, "")
 	require.NoError(t, err)
 	assert.Equal(t, 1, conflicts, "the first file learns the answer from one 409")
 	assert.Equal(t, 2, starts)
 
-	_, err = f.startUpload(ctx, "b.txt", "", 10, "text/plain", time.Time{})
+	_, err = f.startUpload(ctx, "b.txt", "", 10, "text/plain", time.Time{}, "")
 	require.NoError(t, err)
 	assert.Equal(t, 1, conflicts, "the second file sends on_conflict up front")
 	assert.Equal(t, 3, starts)

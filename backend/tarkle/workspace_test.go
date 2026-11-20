@@ -75,7 +75,7 @@ func newTestServer(t *testing.T, accountWide bool, workspaces string) (*httptest
 }
 
 func testConfig(url, workspace string) configmap.Simple {
-	return configmap.Simple{"token": obscure.MustObscure("tok"), "url": url, "workspace": workspace, "list_chunk": "1000", "upload_concurrency": "4"}
+	return configmap.Simple{"token": obscure.MustObscure("tok"), "url": url, "workspace": workspace, "list_chunk": "1000", "upload_concurrency": "4", "keep_versions": "true"}
 }
 
 func TestWorkspaceHeaderOnEveryAPICallNeverOnStorage(t *testing.T) {

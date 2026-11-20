@@ -1,7 +1,6 @@
 package tarkle
 
 import (
-	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -9,6 +8,7 @@ import (
 	"io"
 	"net/http"
 	"slices"
+	"strings"
 	"sync"
 	"time"
 
@@ -16,14 +16,16 @@ import (
 	"github.com/rclone/rclone/fs"
 	"github.com/rclone/rclone/fs/fserrors"
 	"github.com/rclone/rclone/fs/hash"
+	"github.com/rclone/rclone/lib/multipart"
 	"github.com/rclone/rclone/lib/rest"
 )
 
 const (
-	maxPartURLBatch    = 100             // POST /uploads/{id}/parts takes up to 100
-	maxResendRounds    = 3               // times Close re-sends parts the server reports missing
-	maxFinalizeRetries = 5               // times Close asks again after a 409 "finalizing"
-	finalizeRetryDelay = 2 * time.Second // pause between those asks
+	maxPartURLBatch    = 100              // POST /uploads/{id}/parts takes up to 100
+	maxResendRounds    = 3                // times Close re-sends parts the server reports missing
+	maxFinalizeRetries = 5                // times Close asks again after a 409 "finalizing"
+	finalizeRetryDelay = 2 * time.Second  // pause between those asks
+	skipChunkSize      = 16 * 1024 * 1024 // chunk size when nothing is sent, to keep buffers small
 )
 
 // partPlan describes how a file is cut into parts: all parts are
@@ -97,7 +99,8 @@ type chunkWriter struct {
 	multipartID string // only for new versions above 100 MiB
 	renamed     bool   // the server said the name would be changed
 	modTime     time.Time
-	sha256      string // of the source if it was cheap to get, "" if not
+	sha256      string        // of the source when known before the upload, "" if not
+	sumOnClose  func() string // the SHA-256 worked out while the source was read, if any
 
 	mu    sync.Mutex
 	urls  map[int]string
@@ -109,8 +112,8 @@ type chunkWriter struct {
 // questions: when a same name file makes the server ask (409 conflict),
 // the file is being overwritten, so ask for a new version, or for a
 // separate file (renamed back after) where versions are not possible.
-func (f *Fs) startUpload(ctx context.Context, leaf, dirID string, size int64, mime string, modTime time.Time) (*api.UploadStarted, error) {
-	req := api.StartUpload{Name: f.opt.Enc.FromStandardName(leaf), Size: size, ContentType: mime}
+func (f *Fs) startUpload(ctx context.Context, leaf, dirID string, size int64, mime string, modTime time.Time, sum string) (*api.UploadStarted, error) {
+	req := api.StartUpload{Name: f.opt.Enc.FromStandardName(leaf), Size: size, ContentType: mime, SHA256: sum}
 	if size == 0 && !modTime.IsZero() {
 		req.ModifiedAt = formatTime(modTime) // an empty file has no complete step
 	}
@@ -122,6 +125,9 @@ func (f *Fs) startUpload(ctx context.Context, leaf, dirID string, size int64, mi
 	if choice := f.cachedConflictChoice(); choice != "" && (size > 0 || choice != "version") {
 		req.OnConflict = choice
 	}
+	if !f.opt.KeepVersions {
+		req.OnConflict = "separate" // the new file is swapped in and the old one goes to the bin
+	}
 	for attempt := 0; ; attempt++ {
 		var res api.UploadStarted
 		opts := rest.Opts{Method: "POST", Path: "/uploads"}
@@ -130,13 +136,23 @@ func (f *Fs) startUpload(ctx context.Context, leaf, dirID string, size int64, mi
 			return &res, nil
 		}
 		e := apiError(err)
+		if e != nil {
+			switch e.Code() {
+			case "storage_full":
+				// no new file fits: no other transfer will do better
+				return nil, fserrors.FatalError(fmt.Errorf("failed to start upload: %w", err))
+			case "file_too_large", "storage_limit_exceeded":
+				// this file can never be stored, but others may
+				return nil, fserrors.NoRetryError(fmt.Errorf("failed to start upload: %w", err))
+			}
+		}
 		if e == nil || e.Status != http.StatusConflict || attempt > 1 {
 			return nil, fmt.Errorf("failed to start upload: %w", err)
 		}
 		switch e.Code() {
 		case "conflict":
 			req.OnConflict = "version"
-			if size == 0 || !choiceOffered(e, "version") {
+			if size == 0 || !f.opt.KeepVersions || !choiceOffered(e, "version") {
 				req.OnConflict = "separate"
 			}
 			f.rememberConflictChoice(req.OnConflict, size)
@@ -155,14 +171,27 @@ func choiceOffered(e *api.Error, want string) bool {
 	var d struct {
 		Choices []string `json:"choices"`
 	}
-	if json.Unmarshal(e.Wrapper.Details, &d) != nil || len(d.Choices) == 0 {
+	if json.Unmarshal(e.Details(), &d) != nil || len(d.Choices) == 0 {
 		return true
 	}
 	return slices.Contains(d.Choices, want)
 }
 
-// OpenChunkWriter returns the chunk size and a ChunkWriter
+// OpenChunkWriter returns the chunk size and a ChunkWriter. It is used by
+// multi-thread copies, which read the source in ranges out of order, so
+// the SHA-256 is asked of the source before the upload starts.
 func (f *Fs) OpenChunkWriter(ctx context.Context, remote string, src fs.ObjectInfo, options ...fs.OpenOption) (info fs.ChunkWriterInfo, writer fs.ChunkWriter, err error) {
+	info, w, err := f.openChunkWriter(ctx, remote, src, false)
+	if err != nil {
+		return info, nil, err
+	}
+	return info, w, nil
+}
+
+// openChunkWriter starts an upload. If streamed is set the caller reads
+// the source once in order and works out the SHA-256 on the way, so the
+// source is only asked for it first with hash_before_upload.
+func (f *Fs) openChunkWriter(ctx context.Context, remote string, src fs.ObjectInfo, streamed bool) (info fs.ChunkWriterInfo, w *chunkWriter, err error) {
 	size := src.Size()
 	if size < 0 {
 		return info, nil, errors.New("tarkle needs the size of a file before it is uploaded")
@@ -171,16 +200,24 @@ func (f *Fs) OpenChunkWriter(ctx context.Context, remote string, src fs.ObjectIn
 	if err != nil {
 		return info, nil, err
 	}
-	modTime := src.ModTime(ctx)
-	res, err := f.startUpload(ctx, leaf, dirID, size, fs.MimeType(ctx, src), modTime)
-	if err != nil {
-		return info, nil, err
-	}
 	orig := src
 	if or, ok := src.(*fs.OverrideRemote); ok {
 		orig = or.ObjectInfo // so the source can be read again by range
 	}
-	w := &chunkWriter{
+	// A SHA-256 known before the upload starts lets Tarkle skip content it
+	// already has; getting it may mean reading the whole source once more.
+	var sum string
+	if size > 0 && (f.opt.HashBeforeUpload || !streamed) {
+		if s, err := orig.Hash(ctx, hash.SHA256); err == nil {
+			sum = s
+		}
+	}
+	modTime := src.ModTime(ctx)
+	res, err := f.startUpload(ctx, leaf, dirID, size, fs.MimeType(ctx, src), modTime, sum)
+	if err != nil {
+		return info, nil, err
+	}
+	w = &chunkWriter{
 		f:       f,
 		src:     orig,
 		leaf:    f.opt.Enc.FromStandardName(leaf),
@@ -188,10 +225,7 @@ func (f *Fs) OpenChunkWriter(ctx context.Context, remote string, src fs.ObjectIn
 		urls:    map[int]string{},
 		renamed: res.WillBeRenamed,
 		modTime: modTime,
-	}
-	// send the SHA-256 on complete when the source can give it
-	if sum, err := orig.Hash(ctx, hash.SHA256); err == nil && sum != "" {
-		w.sha256 = sum
+		sha256:  sum,
 	}
 	info = fs.ChunkWriterInfo{Concurrency: f.opt.UploadConcurrency}
 	switch res.Action {
@@ -201,13 +235,18 @@ func (f *Fs) OpenChunkWriter(ctx context.Context, remote string, src fs.ObjectIn
 		}
 		w.entry, w.done = *res.File, true
 		info.ChunkSize = 1
-	case "skip": // identical content is already there
-		existing, _, err := f.readMetaDataForPath(ctx, remote)
+	case "skip": // identical content is already there: nothing is sent
+		var existing *api.Item
+		if res.Existing != nil && res.Existing.ID != "" {
+			existing, err = f.statItem(ctx, res.Existing.ID)
+		} else {
+			existing, _, err = f.readMetaDataForPath(ctx, remote)
+		}
 		if err != nil {
 			return info, nil, fmt.Errorf("upload skipped as identical but the file can't be read: %w", err)
 		}
 		w.entry, w.done = *existing, true
-		info.ChunkSize = max(1, size)
+		info.ChunkSize = max(1, min(size, skipChunkSize))
 	case "upload":
 		w.plan, err = newPartPlan(size, res.PartSize, res.PartCount, res.Mode == "single")
 		if err != nil {
@@ -299,24 +338,6 @@ func (w *chunkWriter) WriteChunk(ctx context.Context, chunkNumber int, reader io
 	if err = w.putPart(ctx, n, reader, length); err != nil {
 		return 0, err
 	}
-	// A single-part upload is the whole file in one WriteChunk call: hashing the bytes that were
-	// actually sent (not just trusting whatever orig.Hash() claimed before any byte moved) lets the
-	// server verify what truly went over the wire, and gives rclone's own post-upload Object.Hash()
-	// check something real to compare against. A wrapping Fs that substitutes different bytes than
-	// its ObjectInfo claims (a test double, or any real middleware bug) is otherwise invisible: the
-	// claimed hash still matches on both sides even though the stored content doesn't. Multi-part
-	// uploads keep the opportunistic claim: hashing chunks that may arrive out of order under
-	// concurrency would mean buffering the whole file just to verify it, defeating the point of
-	// streaming large uploads.
-	if w.plan.count == 1 {
-		if _, err := reader.Seek(0, io.SeekStart); err != nil {
-			return 0, fmt.Errorf("failed to seek chunk for hashing: %w", err)
-		}
-		sums, err := hash.StreamTypes(reader, hash.NewHashSet(hash.SHA256))
-		if err == nil {
-			w.sha256 = sums[hash.SHA256]
-		}
-	}
 	return length, nil
 }
 
@@ -324,7 +345,11 @@ func (w *chunkWriter) WriteChunk(ctx context.Context, chunkNumber int, reader io
 func (w *chunkWriter) complete(ctx context.Context) (api.Item, error) {
 	var item api.Item
 	opts := rest.Opts{Method: "POST", Path: "/uploads/" + w.id + "/complete"}
-	req := api.CompleteRequest{MultipartID: w.multipartID, SHA256: w.sha256}
+	sum := w.sha256
+	if sum == "" && w.sumOnClose != nil {
+		sum = w.sumOnClose() // the bytes read (and sent), so Tarkle checks those
+	}
+	req := api.CompleteRequest{MultipartID: w.multipartID, SHA256: sum}
 	if !w.modTime.IsZero() {
 		req.ModifiedAt = formatTime(w.modTime)
 	}
@@ -343,21 +368,28 @@ func (w *chunkWriter) resend(ctx context.Context, parts []int) error {
 		if !ok {
 			return fmt.Errorf("server asked for part %d of %d", n, w.plan.count)
 		}
-		in, err := obj.Open(ctx, &fs.RangeOption{Start: off, End: off + length - 1})
-		if err != nil {
-			return fmt.Errorf("re-reading part %d: %w", n, err)
-		}
-		data, err := io.ReadAll(in)
-		_ = in.Close()
-		if err != nil {
-			return fmt.Errorf("re-reading part %d: %w", n, err)
-		}
-		fs.Infof(w.src, "resending part %d", n)
-		if err = w.putPart(ctx, n, newBytesReader(data), int64(len(data))); err != nil {
+		if err := w.resendPart(ctx, obj, n, off, length); err != nil {
 			return err
 		}
 	}
 	return nil
+}
+
+// resendPart reads part n from obj into a pooled buffer and sends it again
+func (w *chunkWriter) resendPart(ctx context.Context, obj fs.Object, n int, off, length int64) error {
+	in, err := obj.Open(ctx, &fs.RangeOption{Start: off, End: off + length - 1})
+	if err != nil {
+		return fmt.Errorf("re-reading part %d: %w", n, err)
+	}
+	rw := multipart.NewRW().Reserve(length)
+	defer func() { _ = rw.Close() }()
+	_, err = io.CopyN(rw, in, length)
+	_ = in.Close()
+	if err != nil {
+		return fmt.Errorf("re-reading part %d: %w", n, err)
+	}
+	fs.Infof(w.src, "resending part %d", n)
+	return w.putPart(ctx, n, rw, length)
 }
 
 // Close completes the upload. If the server reports parts missing it
@@ -392,7 +424,7 @@ func (w *chunkWriter) Close(ctx context.Context) (err error) {
 			break
 		}
 		var d api.IncompleteDetails
-		_ = json.Unmarshal(e.Wrapper.Details, &d)
+		_ = json.Unmarshal(e.Details(), &d)
 		missing, ok := missingParts(d, w.plan.count)
 		if !ok || len(missing) == 0 {
 			break
@@ -421,13 +453,18 @@ func (w *chunkWriter) fixName(ctx context.Context) error {
 	return w.f.replaceExisting(ctx, w.dirID, w.leaf, &w.entry)
 }
 
-// replaceExisting removes the file called leaf (encoded) in dirID that
-// is not item, then renames item to leaf
+// replaceExisting renames item to leaf (encoded) in dirID, replacing the
+// file of that name (ignoring case, as Tarkle does) if there is one.
+//
+// The API can't rename over a file, so the old file is renamed aside
+// first and only moved to the bin once item has its name. If item can't
+// take the name, the old file gets it back and item (the new copy) goes
+// to the bin, so no stray "name (2)" is left behind.
 func (f *Fs) replaceExisting(ctx context.Context, dirID, leaf string, item *api.Item) error {
-	var old string
+	var old, oldName string
 	_, err := f.listAll(ctx, dirID, api.ItemTypeFile, false, func(i *api.Item) bool {
-		if f.opt.Enc.FromStandardName(i.Name) == leaf && i.ID != item.ID {
-			old = i.ID
+		if name := f.opt.Enc.FromStandardName(i.Name); strings.EqualFold(name, leaf) && i.ID != item.ID {
+			old, oldName = i.ID, name
 			return true
 		}
 		return false
@@ -436,16 +473,36 @@ func (f *Fs) replaceExisting(ctx context.Context, dirID, leaf string, item *api.
 		return err
 	}
 	if old != "" {
-		if err = f.deleteObject(ctx, old); err != nil {
-			return fmt.Errorf("couldn't remove the file being replaced: %w", err)
+		aside := tempName(leaf)
+		if _, err = f.patch(ctx, old, api.Patch{Name: &aside}); err != nil {
+			f.removeNewCopy(ctx, item)
+			return fmt.Errorf("couldn't rename the file being replaced: %w", err)
 		}
 	}
 	renamed, err := f.patch(ctx, item.ID, api.Patch{Name: &leaf})
 	if err != nil {
+		if old != "" {
+			if _, rerr := f.patch(ctx, old, api.Patch{Name: &oldName}); rerr != nil {
+				fs.Errorf(f, "couldn't give %q its name back: %v", oldName, rerr)
+			}
+		}
+		f.removeNewCopy(ctx, item)
 		return err
 	}
 	*item = *renamed
+	if old != "" {
+		if err = f.deleteObject(ctx, old); err != nil {
+			return fmt.Errorf("couldn't remove the replaced file: %w", err)
+		}
+	}
 	return nil
+}
+
+// removeNewCopy moves a new copy that could not take its name to the bin
+func (f *Fs) removeNewCopy(ctx context.Context, item *api.Item) {
+	if err := f.deleteObject(ctx, item.ID); err != nil {
+		fs.Errorf(f, "couldn't remove %q after a failed replace: %v", item.Name, err)
+	}
 }
 
 // Abort the upload (no effect if it was never started on the server)
@@ -462,9 +519,6 @@ func (w *chunkWriter) Abort(ctx context.Context) error {
 	}
 	return nil
 }
-
-// newBytesReader is a ReadSeeker over data
-func newBytesReader(data []byte) io.ReadSeeker { return bytes.NewReader(data) }
 
 func (f *Fs) cachedConflictChoice() string {
 	if f.conflict == nil {

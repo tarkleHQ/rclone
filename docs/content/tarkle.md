@@ -1,7 +1,7 @@
 ---
 title: "Tarkle"
 description: "Rclone docs for Tarkle"
-versionIntroduced: "v1.76"
+versionIntroduced: "v1.77"
 ---
 
 # Tarkle
@@ -100,13 +100,19 @@ second) and `rclone touch` / `--refresh-times` can change it without uploading
 the file again. A file that was uploaded by another client without a time shows
 the time it was last updated on Tarkle. Folders have no modification time.
 
-Tarkle supports SHA-256. rclone sends the SHA-256 of the source when it finishes
-an upload if the source can give it; for files up to 100 MiB Tarkle reads the
-stored file and compares it, and rejects the upload if they differ (rclone then
-uploads the file again). For larger files Tarkle only stores the value it was
-given, which is the uploader's claim and not verified by Tarkle. Files uploaded
-by other clients without a SHA-256 have none, and rclone then compares them by
-size and modification time.
+Tarkle supports SHA-256. rclone works out the SHA-256 of a file while it sends
+it (reading the source only once) and gives it to Tarkle when the upload is
+finished; for files up to 100 MiB Tarkle reads the stored file and compares it,
+and rejects the upload if they differ (rclone then uploads the file again). For
+larger files Tarkle only stores the value it was given, which is the uploader's
+claim and not verified by Tarkle. Files that rclone copies with several threads
+(over `--multi-thread-cutoff`) are hashed before the upload starts, which reads
+them once more. Files uploaded by other clients without a SHA-256 have none, and
+rclone then compares them by size and modification time.
+
+With `--tarkle-hash-before-upload` rclone hashes every file before uploading it,
+so Tarkle can skip a file whose identical content is already there instead of
+receiving it again. This costs one extra read of each file.
 
 ### Uploads, duplicates and versions
 
@@ -125,10 +131,28 @@ old one expired). If the server finds parts missing when the upload is
 finished, rclone reads just those parts from the source again.
 
 Rclone overwrites a file with the same name. On plans where Tarkle keeps
-versions, the new content becomes a new version of the existing file. Otherwise
-the old file is replaced after the new one is uploaded.
+versions, the new content becomes a new version of the existing file, and the
+older versions count toward the storage used. With
+`--tarkle-keep-versions=false`, and on plans without versions, the old file is
+replaced after the new one is uploaded: it is renamed aside, the new file takes
+its name and the old one is moved to the bin. If the new file can't take the
+name, the old one gets it back and the new copy is moved to the bin. A
+server-side copy over an existing file works the same way. Names are compared
+ignoring case, as Tarkle does.
 
 Empty files are created in a single call without an upload.
+
+Every write carries an `Idempotency-Key`, the same on every retry, so a retried
+request whose first answer was lost is not carried out twice.
+
+### Rate limits
+
+Tarkle limits API calls per minute and per day by plan. Rclone reads the
+per-minute window from the headers of every answer and waits for the next window
+instead of running into it; transfers of file data to and from storage are not
+counted. If the daily quota is used up rclone stops with Tarkle's message, as it
+only resets at midnight UTC. Uploads that can never succeed (`file_too_large`)
+are not retried, and `storage_full` stops the run.
 
 ### Deleting
 

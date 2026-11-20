@@ -17,6 +17,8 @@ Notes
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -24,6 +26,7 @@ import (
 	"net/http"
 	"net/url"
 	"path"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -41,6 +44,7 @@ import (
 	"github.com/rclone/rclone/lib/encoder"
 	"github.com/rclone/rclone/lib/multipart"
 	"github.com/rclone/rclone/lib/pacer"
+	"github.com/rclone/rclone/lib/random"
 	"github.com/rclone/rclone/lib/rest"
 )
 
@@ -79,8 +83,9 @@ func init() {
 			Name: "token",
 			Help: `API token.
 
-Create one in the Tarkle workspace settings with the scopes files:read
-and files:write. A token acts as the person who created it.`,
+Create one in Tarkle under Settings > API with the scopes files:read
+and files:write. A token acts as the person who created it and works
+for every workspace that person can use.`,
 			Required:   true,
 			IsPassword: true,
 			Sensitive:  true,
@@ -120,6 +125,26 @@ with purchases can never be deleted through the API.`,
 			Default:  false,
 			Advanced: true,
 		}, {
+			Name: "keep_versions",
+			Help: `Keep the old content as a version when a file is overwritten.
+
+On plans with versions Tarkle keeps the replaced content as an older
+version of the file, and it counts toward the storage used. Set this to
+false to upload the new content as a separate file instead: it takes the
+file's name and the old file is moved to the bin.`,
+			Default:  true,
+			Advanced: true,
+		}, {
+			Name: "hash_before_upload",
+			Help: `Read each file to get its SHA-256 before uploading it.
+
+Tarkle can then skip a file whose identical content is already there
+instead of receiving it again. It costs one extra read of every file
+uploaded. Without it the SHA-256 is worked out while the file is sent
+and Tarkle checks it when the upload is finished.`,
+			Default:  false,
+			Advanced: true,
+		}, {
 			Name:     "disable_listr",
 			Help:     "Don't use the recursive listing (GET /files?recursive=true).",
 			Default:  false,
@@ -142,9 +167,10 @@ with purchases can never be deleted through the API.`,
 					Example: "2006-01-02T15:04:05.999999999Z07:00",
 				},
 				"btime": {
-					Help:    "Time of file birth (creation on Tarkle)",
-					Type:    "RFC 3339",
-					Example: "2006-01-02T15:04:05.999999999Z07:00",
+					Help:     "Time of file birth (creation on Tarkle)",
+					Type:     "RFC 3339",
+					Example:  "2006-01-02T15:04:05.999999999Z07:00",
+					ReadOnly: true,
 				},
 			},
 			Help: "Tarkle reports modification and creation times. Modification time is set through the upload and `rclone touch`; creation time is read only.",
@@ -160,6 +186,8 @@ type Options struct {
 	ListChunk         int                  `config:"list_chunk"`
 	UploadConcurrency int                  `config:"upload_concurrency"`
 	DeleteTransfers   bool                 `config:"delete_transfers"`
+	KeepVersions      bool                 `config:"keep_versions"`
+	HashBeforeUpload  bool                 `config:"hash_before_upload"`
 	DisableListR      bool                 `config:"disable_listr"`
 	Enc               encoder.MultiEncoder `config:"encoding"`
 }
@@ -177,6 +205,78 @@ type Fs struct {
 	storePacer *fs.Pacer          // pacer for storage calls
 
 	conflict *conflictCache // the on_conflict answer the server gave once in this run (a pointer: Fs is copied)
+	limit    *rateLimit     // the API's per-minute window, from its own headers
+}
+
+// rateLimit follows the per-minute window the API reports on every answer
+// (RateLimit-Remaining and RateLimit-Reset), so calls wait for the next
+// window instead of running into 429s. The limit depends on the plan, so
+// it is read from the answers, not configured.
+type rateLimit struct {
+	mu        sync.Mutex
+	remaining int       // calls left in the window, -1 when unknown
+	resetAt   time.Time // when the window ends
+}
+
+func newRateLimit() *rateLimit { return &rateLimit{remaining: -1} }
+
+// update reads the window from the headers of an API answer
+func (r *rateLimit) update(h http.Header, now time.Time) {
+	if r == nil {
+		return
+	}
+	rem, err := strconv.Atoi(h.Get("RateLimit-Remaining"))
+	if err != nil {
+		if rem, err = strconv.Atoi(h.Get("X-RateLimit-Remaining")); err != nil {
+			return
+		}
+	}
+	var resetAt time.Time
+	if secs, err := strconv.Atoi(h.Get("RateLimit-Reset")); err == nil {
+		resetAt = now.Add(time.Duration(secs) * time.Second) // seconds left
+	} else if unix, err := strconv.ParseInt(h.Get("X-RateLimit-Reset"), 10, 64); err == nil {
+		resetAt = time.Unix(unix, 0) // Unix seconds
+	} else {
+		return
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.remaining < 0 || resetAt.After(r.resetAt.Add(5*time.Second)) { // "seconds left" jitters by a second
+		r.remaining = rem // first answer, or a new window
+	} else {
+		r.remaining = min(r.remaining, rem) // answers of calls still in flight count down later
+	}
+	r.resetAt = resetAt
+}
+
+// wait takes one call from the window, waiting for the next window when
+// the current one is used up
+func (r *rateLimit) wait(ctx context.Context) error {
+	if r == nil {
+		return nil
+	}
+	for {
+		r.mu.Lock()
+		now := time.Now()
+		if r.remaining != 0 || !now.Before(r.resetAt) {
+			switch {
+			case r.remaining > 0:
+				r.remaining--
+			case r.remaining == 0:
+				r.remaining = -1 // the window is over: unknown until the next answer
+			}
+			r.mu.Unlock()
+			return nil
+		}
+		d := min(r.resetAt.Sub(now), maxRetryAfter)
+		r.mu.Unlock()
+		fs.Debugf(nil, "tarkle: API calls for this minute are used up, waiting %v", d.Round(time.Second))
+		select {
+		case <-time.After(d):
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+	}
 }
 
 type conflictCache struct {
@@ -248,6 +348,9 @@ func shouldRetry(ctx context.Context, resp *http.Response, err error) (bool, err
 			return true, pacer.RetryAfterError(err, secs)
 		}
 	}
+	if e := apiError(err); e != nil && e.Code() == "idempotency_in_progress" {
+		return true, err // an earlier try of this same write is still running
+	}
 	return fserrors.ShouldRetry(err) || fserrors.ShouldRetryHTTP(resp, retryErrorCodes), err
 }
 
@@ -312,6 +415,7 @@ func NewFs(ctx context.Context, name, root string, m configmap.Mapper) (fs.Fs, e
 		pacer:      fs.NewPacer(ctx, pacer.NewDefault(pacer.MinSleep(minSleep), pacer.MaxSleep(maxSleep), pacer.DecayConstant(decayConstant))),
 		storePacer: fs.NewPacer(ctx, pacer.NewDefault(pacer.MinSleep(minSleep), pacer.MaxSleep(maxSleep), pacer.DecayConstant(decayConstant))),
 		conflict:   &conflictCache{},
+		limit:      newRateLimit(),
 	}
 	f.srv.SetErrorHandler(errorHandler)
 	f.srv.SetHeader("Authorization", "Bearer "+token)
@@ -360,10 +464,25 @@ func NewFs(ctx context.Context, name, root string, m configmap.Mapper) (fs.Fs, e
 
 // ------------------------------------------------------------
 
-// call does an API call with the pacer and decodes the JSON answer into out
+// call does an API call with the pacer and decodes the JSON answer into out.
+//
+// Writes carry an Idempotency-Key, the same on every retry, so a retry of
+// a write that did land (but whose answer was lost) is not done twice.
 func (f *Fs) call(ctx context.Context, opts *rest.Opts, in, out any) error {
+	if opts.Method != "GET" {
+		if opts.ExtraHeaders == nil {
+			opts.ExtraHeaders = map[string]string{}
+		}
+		opts.ExtraHeaders["Idempotency-Key"] = random.String(32)
+	}
 	err := f.pacer.Call(func() (bool, error) {
+		if err := f.limit.wait(ctx); err != nil {
+			return false, err
+		}
 		resp, err := f.srv.CallJSON(ctx, opts, in, out)
+		if resp != nil {
+			f.limit.update(resp.Header, time.Now())
+		}
 		return shouldRetry(ctx, resp, err)
 	})
 	return workspaceError(err)
@@ -546,6 +665,45 @@ func (f *Fs) ListR(ctx context.Context, dir string, callback fs.ListRCallback) (
 	if err != nil {
 		return err
 	}
+	list := walkList{callback: callback, max: fs.GetConfig(ctx).Checkers * 100}
+	err = f.listRFlat(ctx, dir, directoryID, &list)
+	if e := apiError(err); e != nil && e.Code() == "too_large" && list.sent == 0 {
+		// the API refuses recursive listings of subtrees above 5,000 folders
+		fs.Debugf(f, "recursive listing of %q refused as too large: listing one directory at a time", dir)
+		list.entries = nil
+		err = f.listRWalk(ctx, dir, &list)
+	}
+	if err != nil {
+		return err
+	}
+	return list.flush()
+}
+
+// listRWalk lists dir and everything below it one directory at a time
+func (f *Fs) listRWalk(ctx context.Context, dir string, list *walkList) error {
+	dirs := []string{dir}
+	for len(dirs) > 0 {
+		d := dirs[len(dirs)-1]
+		dirs = dirs[:len(dirs)-1]
+		entries, err := f.List(ctx, d)
+		if err != nil {
+			return err
+		}
+		for _, entry := range entries {
+			if sub, ok := entry.(fs.Directory); ok {
+				dirs = append(dirs, sub.Remote())
+			}
+			if err := list.add(entry); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
+}
+
+// listRFlat lists dir recursively with the API's flat listings, one for
+// folders and one for files
+func (f *Fs) listRFlat(ctx context.Context, dir, directoryID string, list *walkList) (err error) {
 	// absolute server path of dir, to turn entry paths into remotes
 	var segs []string
 	for _, s := range strings.Split(path.Join(f.root, dir), "/") {
@@ -554,7 +712,6 @@ func (f *Fs) ListR(ctx context.Context, dir string, callback fs.ListRCallback) (
 		}
 	}
 	prefix := "/" + strings.Join(segs, "/")
-	list := walkList{callback: callback, max: fs.GetConfig(ctx).Checkers * 100}
 	for _, kind := range []string{api.ItemTypeFolder, api.ItemTypeFile} {
 		var iErr error
 		_, err = f.listAll(ctx, directoryID, kind, true, func(info *api.Item) bool {
@@ -586,7 +743,7 @@ func (f *Fs) ListR(ctx context.Context, dir string, callback fs.ListRCallback) (
 			return err
 		}
 	}
-	return list.flush()
+	return nil
 }
 
 // relativePath returns p relative to prefix, both absolute and '/' separated
@@ -605,6 +762,7 @@ type walkList struct {
 	callback fs.ListRCallback
 	max      int
 	entries  fs.DirEntries
+	sent     int // entries handed to callback so far
 }
 
 func (w *walkList) add(e fs.DirEntry) error {
@@ -619,6 +777,7 @@ func (w *walkList) flush() error {
 	if len(w.entries) == 0 {
 		return nil
 	}
+	w.sent += len(w.entries)
 	err := w.callback(w.entries)
 	w.entries = nil
 	return err
@@ -877,36 +1036,54 @@ func (f *Fs) Copy(ctx context.Context, src fs.Object, remote string) (fs.Object,
 	if srcObj.fs.rootSlash()+srcObj.remote == f.rootSlash()+remote {
 		return nil, fmt.Errorf("can't copy %q -> %q as are same name", srcObj.remote, remote)
 	}
-	// copy over an existing file replaces it
-	existing, err := f.NewObject(ctx, remote)
-	if err != nil {
-		existing = nil
-	}
 	dstObj, dstLeaf, dstDirectoryID, err := f.createObject(ctx, remote, srcObj.modTime, srcObj.size)
 	if err != nil {
 		return nil, err
 	}
-	if existing != nil {
-		if err = existing.Remove(ctx); err != nil {
-			return nil, fmt.Errorf("failed to remove existing file before copy: %w", err)
+	leaf := f.opt.Enc.FromStandardName(dstLeaf)
+	item, err := f.copyFile(ctx, srcObj.id, dstDirectoryID, leaf)
+	if e := apiError(err); e != nil && e.Code() == "name_taken" {
+		// a copy can't overwrite: copy under a temporary name, then swap it
+		// in, so the existing file stays until the copy is safely made
+		item, err = f.copyFile(ctx, srcObj.id, dstDirectoryID, tempName(leaf))
+		if err == nil {
+			err = f.replaceExisting(ctx, dstDirectoryID, leaf, item)
 		}
 	}
-	req := api.Copy{Name: f.opt.Enc.FromStandardName(dstLeaf)}
-	if dstDirectoryID != "" {
-		req.ParentID = &dstDirectoryID
+	if err != nil {
+		return nil, err
+	}
+	if err = dstObj.setMetaData(item); err != nil {
+		return nil, err
+	}
+	return dstObj, nil
+}
+
+// copyFile copies the file id to the folder dirID as leaf (encoded)
+func (f *Fs) copyFile(ctx context.Context, id, dirID, leaf string) (*api.Item, error) {
+	req := api.Copy{Name: leaf}
+	if dirID != "" {
+		req.ParentID = &dirID
 	}
 	var item api.Item
-	opts := rest.Opts{Method: "POST", Path: "/files/" + srcObj.id + "/copy"}
-	if err = f.call(ctx, &opts, &req, &item); err != nil {
+	opts := rest.Opts{Method: "POST", Path: "/files/" + id + "/copy"}
+	if err := f.call(ctx, &opts, &req, &item); err != nil {
 		if e := apiError(err); e != nil && e.Code() == "storage_full" {
 			return nil, fserrors.FatalError(err)
 		}
 		return nil, fmt.Errorf("failed to copy: %w", err)
 	}
-	if err = dstObj.setMetaData(&item); err != nil {
-		return nil, err
+	return &item, nil
+}
+
+// tempName returns a short unique name for a file that will be renamed
+// to leaf, keeping leaf's extension
+func tempName(leaf string) string {
+	ext := path.Ext(leaf)
+	if len(ext) > 16 {
+		ext = ""
 	}
-	return dstObj, nil
+	return "rclone-tmp-" + random.String(12) + ext
 }
 
 func (f *Fs) rootSlash() string {
@@ -1103,17 +1280,45 @@ func (o *Object) Update(ctx context.Context, in io.Reader, src fs.ObjectInfo, op
 	if size < 0 {
 		return errors.New("tarkle needs the size of a file before it is uploaded")
 	}
-	// (the chunk writer handles size 0 too: it needs no parts)
 	// the upload goes to this object's remote, which may differ from src's
-	cw, err := multipart.UploadMultipart(ctx, fs.NewOverrideRemote(src, o.remote), in, multipart.UploadMultipartOptions{
-		Open:        o.fs,
+	info, w, err := o.fs.openChunkWriter(ctx, o.remote, src, true)
+	if err != nil {
+		return err
+	}
+	if w.done {
+		// an empty file or identical content: don't read the source at all
+		if err = w.Close(ctx); err != nil {
+			return err
+		}
+		return o.setMetaData(&w.entry)
+	}
+	if w.sha256 == "" {
+		// the source is read once, in order: hash it on the way and send
+		// the SHA-256 when the upload is finished, for Tarkle to check
+		h := sha256.New()
+		in = io.TeeReader(in, h)
+		w.sumOnClose = func() string { return hex.EncodeToString(h.Sum(nil)) }
+	}
+	_, err = multipart.UploadMultipart(ctx, src, in, multipart.UploadMultipartOptions{
+		Open:        openedChunkWriter{info: info, w: w},
 		OpenOptions: options,
 	})
 	if err != nil {
 		return err
 	}
-	w := cw.(*chunkWriter)
 	return o.setMetaData(&w.entry)
+}
+
+// openedChunkWriter hands an upload that was started already to
+// multipart.UploadMultipart
+type openedChunkWriter struct {
+	info fs.ChunkWriterInfo
+	w    *chunkWriter
+}
+
+// OpenChunkWriter returns the upload that was started already
+func (o openedChunkWriter) OpenChunkWriter(ctx context.Context, remote string, src fs.ObjectInfo, options ...fs.OpenOption) (fs.ChunkWriterInfo, fs.ChunkWriter, error) {
+	return o.info, o.w, nil
 }
 
 // Check the interfaces are satisfied
