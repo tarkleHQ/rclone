@@ -8,7 +8,6 @@ import (
 	"io"
 	"net/http"
 	"slices"
-	"strings"
 	"sync"
 	"time"
 
@@ -463,7 +462,7 @@ func (w *chunkWriter) fixName(ctx context.Context) error {
 func (f *Fs) replaceExisting(ctx context.Context, dirID, leaf string, item *api.Item) error {
 	var old, oldName string
 	_, err := f.listAll(ctx, dirID, api.ItemTypeFile, false, func(i *api.Item) bool {
-		if name := f.opt.Enc.FromStandardName(i.Name); strings.EqualFold(name, leaf) && i.ID != item.ID {
+		if name := f.opt.Enc.FromStandardName(i.Name); nameKey(name) == nameKey(leaf) && i.ID != item.ID {
 			old, oldName = i.ID, name
 			return true
 		}

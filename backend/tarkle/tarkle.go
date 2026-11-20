@@ -30,6 +30,7 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"unicode"
 
 	"github.com/rclone/rclone/backend/tarkle/api"
 	"github.com/rclone/rclone/fs"
@@ -46,6 +47,7 @@ import (
 	"github.com/rclone/rclone/lib/pacer"
 	"github.com/rclone/rclone/lib/random"
 	"github.com/rclone/rclone/lib/rest"
+	"golang.org/x/text/unicode/norm"
 )
 
 const (
@@ -580,10 +582,22 @@ func (f *Fs) listAll(ctx context.Context, dirID string, kind string, recursive b
 	}
 }
 
+// nameKey is the key Tarkle compares names by (normalizeName in
+// lib/file-version-core.mjs): Unicode NFC, runs of white space made one
+// space, trimmed, lower case. Two names with the same key are the same name
+// to Tarkle, so a file with one of them blocks the other (409 name_taken).
+// strings.EqualFold alone is not enough: "e" + combining accent and "é" are
+// the same name to Tarkle, and so are "a  b" and "a b".
+func nameKey(name string) string {
+	// white space as JavaScript's \s and trim() see it: not U+0085, with U+FEFF
+	isSpace := func(r rune) bool { return r != 0x85 && unicode.IsSpace(r) || r == 0xFEFF }
+	return strings.ToLower(strings.Join(strings.FieldsFunc(norm.NFC.String(name), isSpace), " "))
+}
+
 // FindLeaf finds a directory of name leaf in the folder with ID pathID
 func (f *Fs) FindLeaf(ctx context.Context, pathID, leaf string) (pathIDOut string, found bool, err error) {
 	found, err = f.listAll(ctx, pathID, api.ItemTypeFolder, false, func(item *api.Item) bool {
-		if strings.EqualFold(item.Name, leaf) { // names are case insensitive
+		if nameKey(item.Name) == nameKey(leaf) { // the same name as Tarkle sees it
 			pathIDOut = item.ID
 			return true
 		}
