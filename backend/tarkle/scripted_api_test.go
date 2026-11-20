@@ -278,6 +278,8 @@ func TestUpdateIdenticalContentDoesNotReadSource(t *testing.T) {
 			return 200, `{"action":"skip","existing":{"id":"1","name":"f.txt"}}`
 		case c.method == "GET" && c.path == "/files/1":
 			return 200, fileJSON("1", "f.txt")
+		case c.method == "PATCH" && c.path == "/files/1": // the source's modification time is set on the identical file
+			return 200, fileJSON("1", "f.txt")
 		}
 		return problem(404, "not_found")
 	})

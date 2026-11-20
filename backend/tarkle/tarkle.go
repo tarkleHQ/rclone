@@ -466,6 +466,22 @@ func NewFs(ctx context.Context, name, root string, m configmap.Mapper) (fs.Fs, e
 
 // ------------------------------------------------------------
 
+// isUploadStep reports whether a call is a step of an upload after its start: the status (GET /uploads/{id}), the abort (DELETE /uploads/{id}),
+// more part URLs (POST /uploads/{id}/parts) or the completion (POST /uploads/{id}/complete). The start, POST /uploads, is counted.
+func isUploadStep(method, p string) bool {
+	rest, ok := strings.CutPrefix(p, "/uploads/")
+	if !ok || rest == "" {
+		return false
+	}
+	switch segs := strings.Split(rest, "/"); len(segs) {
+	case 1:
+		return method == "GET" || method == "DELETE"
+	case 2:
+		return method == "POST" && (segs[1] == "parts" || segs[1] == "complete")
+	}
+	return false
+}
+
 // call does an API call with the pacer and decodes the JSON answer into out.
 //
 // Writes carry an Idempotency-Key, the same on every retry, so a retry of
@@ -477,12 +493,18 @@ func (f *Fs) call(ctx context.Context, opts *rest.Opts, in, out any) error {
 		}
 		opts.ExtraHeaders["Idempotency-Key"] = random.String(32)
 	}
+	// The steps of an upload after its start are not counted in the server's per-minute window, and the server answers them with a full window
+	// (remaining = the limit). So they neither take a call from the local window nor teach it anything: counting them would use the window up
+	// on calls the server never counted and make the transfer wait for a minute it did not need.
+	exempt := isUploadStep(opts.Method, opts.Path)
 	err := f.pacer.Call(func() (bool, error) {
-		if err := f.limit.wait(ctx); err != nil {
-			return false, err
+		if !exempt {
+			if err := f.limit.wait(ctx); err != nil {
+				return false, err
+			}
 		}
 		resp, err := f.srv.CallJSON(ctx, opts, in, out)
-		if resp != nil {
+		if resp != nil && !exempt {
 			f.limit.update(resp.Header, time.Now())
 		}
 		return shouldRetry(ctx, resp, err)

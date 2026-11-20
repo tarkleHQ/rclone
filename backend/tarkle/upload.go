@@ -97,6 +97,7 @@ type chunkWriter struct {
 	id          string // upload id, "" for an empty file
 	multipartID string // only for new versions above 100 MiB
 	renamed     bool   // the server said the name would be changed
+	skipped     bool   // identical content was already there: nothing was sent
 	modTime     time.Time
 	sha256      string        // of the source when known before the upload, "" if not
 	sumOnClose  func() string // the SHA-256 worked out while the source was read, if any
@@ -244,7 +245,7 @@ func (f *Fs) openChunkWriter(ctx context.Context, remote string, src fs.ObjectIn
 		if err != nil {
 			return info, nil, fmt.Errorf("upload skipped as identical but the file can't be read: %w", err)
 		}
-		w.entry, w.done = *existing, true
+		w.entry, w.done, w.skipped = *existing, true, true
 		info.ChunkSize = max(1, min(size, skipChunkSize))
 	case "upload":
 		w.plan, err = newPartPlan(size, res.PartSize, res.PartCount, res.Mode == "single")
@@ -395,7 +396,10 @@ func (w *chunkWriter) resendPart(ctx context.Context, obj fs.Object, n int, off,
 // reads just those from the source again and tries once more.
 func (w *chunkWriter) Close(ctx context.Context) (err error) {
 	if w.done {
-		return w.fixName(ctx) // an empty file may have been renamed too
+		if err = w.fixName(ctx); err != nil { // an empty file may have been renamed too
+			return err
+		}
+		return w.syncModTime(ctx)
 	}
 	finalizing := 0
 	for round := 0; ; round++ {
@@ -502,6 +506,24 @@ func (f *Fs) removeNewCopy(ctx context.Context, item *api.Item) {
 	if err := f.deleteObject(ctx, item.ID); err != nil {
 		fs.Errorf(f, "couldn't remove %q after a failed replace: %v", item.Name, err)
 	}
+}
+
+// syncModTime gives a file whose upload was skipped as identical the modification time of the source: the content is the same, but rclone
+// expects an updated file to carry the source's time, and without it the next sync sees a different time and uploads again.
+func (w *chunkWriter) syncModTime(ctx context.Context) error {
+	if !w.skipped || w.modTime.IsZero() {
+		return nil
+	}
+	if w.entry.ModifiedAt != nil && w.entry.ModifiedAt.Sub(w.modTime).Abs() < time.Second {
+		return nil // the same time already (Tarkle keeps whole seconds)
+	}
+	stamp := formatTime(w.modTime)
+	item, err := w.f.patch(ctx, w.entry.ID, api.Patch{ModifiedAt: &stamp})
+	if err != nil {
+		return fmt.Errorf("couldn't set the modification time of the identical file: %w", err)
+	}
+	w.entry = *item
+	return nil
 }
 
 // Abort the upload (no effect if it was never started on the server)
